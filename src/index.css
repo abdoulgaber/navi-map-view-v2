@@ -977,7 +977,7 @@ input  { font-family: var(--font); border: none; outline: none; background: none
 .compare-bar {
   position: absolute;
   left: 452px; /* clear of the floating list panel */
-  right: 16px;
+  right: 62px; /* clear of the zoom controls */
   bottom: 16px;
   display: flex;
   align-items: center;
@@ -1769,11 +1769,23 @@ input  { font-family: var(--font); border: none; outline: none; background: none
   .list-panel { width: 340px; }
   .tools-panel { left: 372px; }
   .compare-bar { left: 372px; }
+  /* "Compare (4) ✕" is wider than the idle button — a slimmer switcher
+     keeps the two apart on narrow tablets */
+  .mapmode { width: 224px; }
+  .mapmode-tab { padding: 8px 10px; gap: 6px; }
   .pdrawer { width: 480px; max-width: calc(100% - 380px); }
+}
+
+/* Tablet widths leave no room beside an open drawer, so it starts below the
+   map's top row — Compare and the Map/Satellite switcher stay reachable
+   (skipped on short screens, where that row would eat the drawer) */
+@media (min-width: 768px) and (max-width: 1199px) and (min-height: 561px) {
+  .pdrawer { top: 74px; }
 }
 
 /* ── Phone ──────────────────────────────────────────────────────────────── */
 @media (max-width: 767px) {
+  :root { --navbar-h: 60px; }   /* compare table + backdrop start under the slimmer bar */
   .navbar { height: 60px; padding: 0 14px; gap: 10px; }
   .navbar-logo .logo-engaz { font-size: 17px; }
   .navbar-logo .logo-navi  { font-size: 11px; }
@@ -1861,7 +1873,44 @@ input  { font-family: var(--font); border: none; outline: none; background: none
   .mapmode-tab { padding: 7px 8px; font-size: 12.5px; gap: 5px; }
   .mapmode-tab svg { width: 16px; height: 16px; }
   .map-zoom { display: none; }          /* pinch to zoom on touch */
-  .compare-bar { left: 12px; right: 12px; bottom: 100px; padding: 10px 12px; }
+  /* Compare tray docks to the bottom edge and the sheet rides on top of it.
+     Floating over the map it sat under the sheet (z 40), which buried the
+     tray and its Compare action at every sheet height. */
+  .map-view { --cbar-h: 64px; }
+  .compare-bar {
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: var(--cbar-h);
+    gap: 10px;
+    padding: 10px 12px;
+    border: none;
+    border-top: 1px solid var(--border);
+    border-radius: 0;
+    box-shadow: none;
+    z-index: 45;
+  }
+  .map-view--comparing .list-panel {
+    bottom: var(--cbar-h);
+    max-height: calc(100% - var(--cbar-h) - 8px);
+  }
+  /* one row: picked projects scroll sideways instead of growing the tray */
+  .compare-chips {
+    flex-wrap: nowrap;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .compare-chips::-webkit-scrollbar { display: none; }
+  .compare-chip { flex-shrink: 0; }
+  .compare-hint {
+    font-size: 12px;
+    line-height: 16px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
   .compare-view, .compare-clear { padding: 8px 12px; font-size: 12px; }
 
   /* the detail panel becomes a sheet of its own */

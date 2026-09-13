@@ -137,13 +137,14 @@ export default function MapView({ filters, search, sort }) {
     }, DRAWER_ANIM_MS)
   }, [])
 
+  /* One mode at a time: comparing retires the single-project drawer, which
+     would otherwise sit over the compare tray and its actions */
   const toggleCompareMode = useCallback(() => {
-    setCompareMode(mode => {
-      const next = !mode
-      if (!next) setCompareSel([])
-      return next
-    })
-  }, [])
+    const next = !compareMode
+    setCompareMode(next)
+    if (!next) setCompareSel([])
+    else if (drawerProject) handleCloseDrawer()
+  }, [compareMode, drawerProject, handleCloseDrawer])
 
   /* Drag / flick the sheet between its three stops */
   const onSheetPointerDown = (e) => {
@@ -169,7 +170,7 @@ export default function MapView({ filters, search, sort }) {
   const sheetClass = isCompact ? ` list-panel--sheet list-panel--${sheet}` : ''
 
   return (
-    <div className={`map-view${isCompact ? ' map-view--compact' : ''}`}>
+    <div className={`map-view${isCompact ? ' map-view--compact' : ''}${compareMode ? ' map-view--comparing' : ''}`}>
       {/* Left panel */}
       <aside className={`list-panel${sheetClass}`}>
         {isCompact && (
