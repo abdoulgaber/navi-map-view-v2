@@ -25,62 +25,138 @@ export const estimatePillW = (label) => label.length * 7.9 + 26
 export const intersects = (a, b) =>
   a.x1 < b.x2 && a.x2 > b.x1 && a.y1 < b.y2 && a.y2 > b.y1
 
-const rectAt = (pt, w, h) => ({
-  x1: pt.x - w / 2, y1: pt.y - h / 2,
-  x2: pt.x + w / 2, y2: pt.y + h / 2,
-})
+export const MIN_BUBBLE = 2      // a bubble never holds a single project
+export const STEP_OUT_MAX = 12   // names only step out of neighbourhood-sized bubbles —
+                                 // a stray name beside "842" reads as noise, not information
 
 /**
- * @param entries      [{ id, x, y, label }] — viewport-filtered, in list order
- * @param priorityIds  selected / compare projects: placed first and never
- *                     hidden (they may sit over a bubble, never vanish)
- * @param fixed        [{ x, y, w, h }] — cluster bubbles every other pin
- *                     has to find room around
- * @returns { modes, order, hidden } — `order` is the priority sequence,
- *          reused by the DOM repair pass so demotions stay consistent.
+ * Names where they fit, numbers where they don't.
+ *
+ * Every group starts out holding its smallest footprint — a bubble for a
+ * cluster, a dot for a lone project — so whatever is decided later, nothing
+ * can ever land on top of anything else. Then, lone projects first and
+ * smaller clusters next, projects step out of their group as full name
+ * pills at their real positions whenever the pill clears everything:
+ *
+ *  - lone project → name pill, or its dot if the name can't breathe
+ *  - cluster whose names all fit → opens up entirely into name pills
+ *  - otherwise → the names that fit step out and the rest stay in the
+ *    bubble, which always keeps at least MIN_BUBBLE projects
+ *  - selected / compare projects always get their pill
+ *
+ * @param groups [{ key, kind: 'cluster'|'point', x, y, w, h, members: [{ id, x, y }] }]
+ *               x/y/w/h = the bubble (clusters); members at their own positions
+ * @param obstacles [{ x1, y1, x2, y2 }] interface chrome over the map (list
+ *                  panel, controls) — a name is never tucked half under it
+ * @returns { bubbles: Map<key, projectIds still inside>, pins: Map<projectId, 'pill'|'dot'> }
  */
-export function computePlacements(entries, { priorityIds = [], fixed = [] } = {}) {
-  /* Priority: selected / compare picks → incoming (list sort) order */
-  const rank = new Map(priorityIds.map((id, i) => [id, i]))
-  const ordered = entries.map((e, i) => ({ ...e, i })).sort((a, b) => {
-    const pd = (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity)
-    return pd !== 0 ? pd : a.i - b.i
+export function placeMarkers(groups, { labelOf, priorityIds = [], rankOf = () => 0, obstacles = [] } = {}) {
+  const box = (x, y, w, h, pad) => ({
+    x1: x - w / 2 - pad / 2, y1: y - h / 2 - pad / 2,
+    x2: x + w / 2 + pad / 2, y2: y + h / 2 + pad / 2,
   })
+  const pillBox = (m) => box(m.x, m.y, estimatePillW(labelOf(m.id)), PILL_H, PILL_GAP)
+  const dotBox  = (m) => box(m.x, m.y, DOT_SIZE, DOT_SIZE, DOT_GAP + HOVER_ROOM)
 
-  const obstacles = fixed.map(f => rectAt(f, f.w + PILL_GAP, f.h + PILL_GAP))
+  const priority = new Map(priorityIds.map((id, i) => [id, i]))
+  const priorityOf = (g) =>
+    g.kind === 'point' && priority.has(g.members[0].id) ? priority.get(g.members[0].id) : Infinity
+  const bestRank = (g) => Math.min(...g.members.map(m => rankOf(m.id)))
+
+  // every group holds its smallest footprint until projects step out of it
+  const reserved = new Map(groups.map(g => [
+    g.key,
+    g.kind === 'cluster' ? box(g.x, g.y, g.w, g.h, PILL_GAP) : dotBox(g.members[0]),
+  ]))
+  obstacles.forEach((o, i) => reserved.set(`chrome:${i}`, o))
   const placed = []
-  const modes  = new Map()
-  const leftovers = []
-  const blocked = (rect, e) =>
-    placed.some(r => intersects(rect, r)) ||
-    (!rank.has(e.id) && obstacles.some(r => intersects(rect, r)))
+  const blocked = (p, ownKey) =>
+    placed.some(q => intersects(p, q)) ||
+    [...reserved].some(([key, r]) => key !== ownKey && intersects(p, r))
 
-  // Tier 1 — name chips
-  for (const e of ordered) {
-    const rect = rectAt(e, estimatePillW(e.label) + PILL_GAP, PILL_H + PILL_GAP)
-    if (blocked(rect, e)) {
-      leftovers.push(e)
-    } else {
-      placed.push(rect)
-      modes.set(e.id, 'pill')
+  const pins = new Map()
+  const bubbles = new Map()
+
+  const ordered = [...groups].sort((a, b) =>
+    (priorityOf(a) - priorityOf(b)) ||
+    (a.members.length - b.members.length) ||
+    (bestRank(a) - bestRank(b)))
+
+  for (const g of ordered) {
+    if (g.kind === 'point') {
+      const m = g.members[0]
+      const pill = pillBox(m)
+      if (priorityOf(g) !== Infinity || !blocked(pill, g.key)) {
+        reserved.delete(g.key)
+        placed.push(pill)
+        pins.set(m.id, 'pill')
+      } else {
+        pins.set(m.id, 'dot')   // its reserved footprint is already clear
+      }
+      continue
+    }
+
+    const members = [...g.members].sort((a, b) => rankOf(a.id) - rankOf(b.id))
+    if (members.length > STEP_OUT_MAX) {
+      bubbles.set(g.key, members.map(m => m.id))
+      continue
+    }
+    const pills = members.map(pillBox)
+
+    // every name fits → the bubble opens up entirely
+    const opens = pills.every((p, i) =>
+      !blocked(p, g.key) && pills.every((q, j) => j === i || !intersects(p, q)))
+    if (opens) {
+      reserved.delete(g.key)
+      placed.push(...pills)
+      members.forEach(m => pins.set(m.id, 'pill'))
+      continue
+    }
+
+    // otherwise the names that fit step out, clear of the bubble itself
+    const own = reserved.get(g.key)
+    const out = []
+    members.forEach((m, i) => {
+      const p = pills[i]
+      if (intersects(p, own) || blocked(p, g.key) || out.some(o => intersects(p, o.p))) return
+      out.push({ m, p })
+    })
+    while (members.length - out.length < MIN_BUBBLE && out.length) out.pop()
+
+    out.forEach(({ m, p }) => { placed.push(p); pins.set(m.id, 'pill') })
+    const stepped = new Set(out.map(o => o.m.id))
+    bubbles.set(g.key, members.filter(m => !stepped.has(m.id)).map(m => m.id))
+  }
+
+  /* Second chance for lone dots: a bubble that opened up may have freed the
+     room for their name; failing that, a dot squeezed against a bubble joins
+     it — as long as the count keeps the bubble's width. Only a project boxed
+     in by other names stays a dot. */
+  const byKey = new Map(groups.map(g => [g.key, g]))
+  for (const [id, mode] of [...pins]) {
+    if (mode !== 'dot') continue
+    const g = groups.find(x => x.kind === 'point' && x.members[0].id === id)
+    const pill = pillBox(g.members[0])
+    if (!blocked(pill, g.key)) {
+      reserved.delete(g.key)
+      placed.push(pill)
+      pins.set(id, 'pill')
+      continue
+    }
+    const host = [...bubbles.keys()].find(key => {
+      const r = reserved.get(key)
+      const ids = bubbles.get(key)
+      return r && intersects(pill, r) &&
+        String(ids.length + 1).length <= String(byKey.get(key).members.length).length
+    })
+    if (host) {
+      bubbles.get(host).push(id)
+      pins.delete(id)
+      reserved.delete(g.key)
     }
   }
 
-  // Tier 2 — dots (tested against chips, dots *and* bubbles)
-  const dotBox = DOT_SIZE + DOT_GAP + HOVER_ROOM
-  let hidden = 0
-  for (const e of leftovers) {
-    const rect = rectAt(e, dotBox, dotBox)
-    if (blocked(rect, e) && !rank.has(e.id)) {
-      modes.set(e.id, 'hidden')   // Tier 3 — never stack
-      hidden++
-    } else {
-      placed.push(rect)
-      modes.set(e.id, 'dot')
-    }
-  }
-
-  return { modes, order: ordered.map(e => e.id), hidden }
+  return { bubbles, pins }
 }
 
 /**
@@ -89,18 +165,20 @@ export function computePlacements(entries, { priorityIds = [], fixed = [] } = {}
  * transforms can drift a few pixels from the model; this guarantees what
  * the broker actually sees never overlaps.
  *
- * @param order    priority sequence from computePlacements
+ * @param order    ids in priority order (best first)
  * @param get      (id) => { mode, rect() , setMode(mode) }
  * @param gap      minimum breathing room between rendered markers (px)
- * @returns number of markers demoted to hidden
+ * @param canHide  false → a pin is never removed, only shrunk to a dot
+ *                 (the map relies on every project staying visible)
+ * @returns number of markers changed
  */
-export function repairOverlaps(order, get, gap = 6, fixedRects = []) {
+export function repairOverlaps(order, get, gap = 6, fixedRects = [], { canHide = true } = {}) {
   const pad = (r) => ({
     x1: r.left - gap / 2, y1: r.top - gap / 2,
     x2: r.right + gap / 2, y2: r.bottom + gap / 2,
   })
   const accepted = fixedRects.map(pad)
-  let hidden = 0
+  let changed = 0
 
   for (const id of order) {
     const m = get(id)
@@ -110,15 +188,14 @@ export function repairOverlaps(order, get, gap = 6, fixedRects = []) {
     if (accepted.some(a => intersects(box, a))) {
       if (m.mode === 'pill') {
         m.setMode('dot')                 // try the smaller footprint
+        changed++
         box = pad(m.rect())
-        if (accepted.some(a => intersects(box, a))) {
-          m.setMode('hidden'); hidden++; continue
-        }
-      } else {
-        m.setMode('hidden'); hidden++; continue
+      }
+      if (canHide && accepted.some(a => intersects(box, a))) {
+        m.setMode('hidden'); changed++; continue
       }
     }
     accepted.push(box)
   }
-  return hidden
+  return changed
 }

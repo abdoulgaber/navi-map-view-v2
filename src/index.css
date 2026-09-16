@@ -690,34 +690,6 @@ input  { font-family: var(--font); border: none; outline: none; background: none
 .map-canvas-gl canvas { outline: none; }
 .maplibregl-marker:hover { z-index: 5; }
 
-/* ─── Overflow hint ───────────────────────────────────────────────────────── */
-.zoom-hint {
-  position: absolute;
-  bottom: 16px;
-  left: 50%;
-  transform: translateX(-50%);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 16px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.7);
-  background: rgba(255, 255, 255, 0.86);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  box-shadow: 0 6px 20px rgba(16, 24, 40, 0.16);
-  font-family: var(--font);
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--gray-600);
-  white-space: nowrap;
-  cursor: pointer;
-  z-index: 20;
-  transition: background 0.15s;
-}
-.zoom-hint:hover { background: var(--white); }
-.zoom-hint strong { color: var(--primary); font-weight: 700; }
-
 /* ─── Dot pins (decluttered projects) ─────────────────────────────────────── */
 .dot-pin {
   width: 12px;
@@ -729,7 +701,10 @@ input  { font-family: var(--font); border: none; outline: none; background: none
   box-shadow: 0 1px 4px rgba(16, 24, 40, 0.3);
   cursor: pointer;
   font-size: 0;
-  transition: transform 0.12s, background 0.12s;
+  /* never transition `transform` on a marker: MapLibre positions markers
+     with it, so a transition makes pins trail the map and drift over each
+     other after every move */
+  transition: background 0.12s;
 }
 .dot-pin:hover {
   transform: scale(1.45);
@@ -759,7 +734,7 @@ input  { font-family: var(--font); border: none; outline: none; background: none
   box-shadow: 0 4px 14px rgba(16, 24, 40, 0.18);
   font-family: var(--font);
   cursor: pointer;
-  transition: transform 0.15s, box-shadow 0.15s;
+  transition: box-shadow 0.15s;   /* no `transform` — see .dot-pin */
 }
 .cluster-pin:hover {
   transform: scale(1.07);
@@ -795,7 +770,7 @@ input  { font-family: var(--font); border: none; outline: none; background: none
   max-width: 190px;
   overflow: hidden;
   text-overflow: ellipsis;
-  transition: transform 0.12s, background 0.12s, color 0.12s;
+  transition: background 0.12s, color 0.12s;   /* no `transform` — see .dot-pin */
 }
 .price-pin.map-pin--hover,
 .price-pin:hover {

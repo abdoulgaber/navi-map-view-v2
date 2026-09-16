@@ -12,9 +12,36 @@ import Supercluster from 'supercluster'
  * a map instance (see clusters.test.mjs).
  */
 
-export const CLUSTER_RADIUS   = 72   // px — a bubble plus generous breathing room
 export const CLUSTER_MAX_ZOOM = 15   // past this every project stands alone
 export const FIT_MAX_ZOOM     = 16
+
+/**
+ * Grouping radius per zoom level (px). Zoomed out, a tighter radius keeps
+ * the country view readable — a handful of city-sized bubbles rather than
+ * one blob. Zoomed in, a wide radius turns what would be a field of 2s and
+ * 3s into a few meaningful bubbles; wherever a name fits, projects step out
+ * of their bubble anyway (placeMarkers in placement.js). Tuned on the real
+ * catalogue — see clusters.test.mjs / placement.test.mjs.
+ */
+export const CLUSTER_RADIUS = 140   // the widest radius used at any zoom
+export const radiusAt = (zoom) =>
+  zoom <= 8 ? 72 : zoom === 9 ? 90 : zoom === 10 ? 110 : CLUSTER_RADIUS
+
+/* Supercluster reads `options.radius` once per zoom level while it builds
+   the hierarchy; swapping it in for that level gives a zoom-aware radius.
+   The base option stays at the widest value because getChildren/getLeaves
+   search with it — a wider search still finds every child. */
+class ZoomAwareSupercluster extends Supercluster {
+  _cluster(data, numItems, zoom, out) {
+    const widest = this.options.radius
+    this.options.radius = radiusAt(zoom)
+    try {
+      return super._cluster(data, numItems, zoom, out)
+    } finally {
+      this.options.radius = widest
+    }
+  }
+}
 
 const GAP      = 6    // minimum room between two rendered bubbles (px)
 const DOT_SIZE = 12   // a single project's smallest footprint (see .dot-pin)
@@ -31,7 +58,7 @@ export const bubbleSize = (count) => ({
  *                  (the selected one, compare picks)
  */
 export function buildClusterIndex(projects, looseIds = new Set()) {
-  const index = new Supercluster({ radius: CLUSTER_RADIUS, maxZoom: CLUSTER_MAX_ZOOM })
+  const index = new ZoomAwareSupercluster({ radius: CLUSTER_RADIUS, maxZoom: CLUSTER_MAX_ZOOM })
   index.load(
     projects
       .filter(p => !looseIds.has(p.id))
@@ -127,6 +154,21 @@ const keyOf = (g) => g.kind === 'point'
   ? `p:${g.projectId}`
   : `c:${[...g.clusterIds].sort((a, b) => a - b).join('+')}|${g.points.map(p => p.projectId).sort((a, b) => a - b).join('+')}`
 
+/** Every project inside a group, with its own position */
+export function groupMembers(index, group) {
+  if (group.kind === 'point') return [{ projectId: group.projectId, lng: group.lng, lat: group.lat }]
+  const members = group.points.map(p => ({ ...p }))
+  for (const id of group.clusterIds) {
+    let leaves
+    try { leaves = index.getLeaves(id, Infinity) } catch { continue }
+    for (const leaf of leaves) {
+      const [lng, lat] = leaf.geometry.coordinates
+      members.push({ projectId: leaf.properties.projectId, lng, lat })
+    }
+  }
+  return members
+}
+
 /**
  * Where a tap on a group should take the camera: the bounds of exactly its
  * projects, plus `splitZoom` — the least zoom that breaks it apart.
@@ -137,28 +179,30 @@ const keyOf = (g) => g.kind === 'point'
  * forcing the floor there would push some of its projects off screen.
  */
 export function groupTarget(index, group) {
-  const coords = group.points.map(p => [p.lng, p.lat])
-  const projectIds = group.points.map(p => p.projectId)
-  const single = group.clusterIds.length === 1 && group.points.length === 0
-  let splitZoom = 0
-
-  for (const id of group.clusterIds) {
-    let leaves
-    try { leaves = index.getLeaves(id, Infinity) } catch { continue }
-    for (const leaf of leaves) {
-      coords.push(leaf.geometry.coordinates)
-      projectIds.push(leaf.properties.projectId)
-    }
-    if (single) splitZoom = index.getClusterExpansionZoom(id)
+  const members = groupMembers(index, group)
+  if (!members.length) return null
+  return {
+    bounds: boundsOf(members),
+    count: members.length,
+    projectIds: members.map(m => m.projectId),
+    splitZoom: splitZoomOf(index, group),
   }
-  if (!coords.length) return null
+}
 
+/** The zoom a tap must reach for this group to break apart (0 = just fit it) */
+export function splitZoomOf(index, group) {
+  const single = group.kind === 'cluster' && group.clusterIds.length === 1 && group.points.length === 0
+  return single ? index.getClusterExpansionZoom(group.clusterIds[0]) : 0
+}
+
+/** [[w, s], [e, n]] around [{ lng, lat }] */
+export function boundsOf(members) {
   let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity
-  for (const [lng, lat] of coords) {
+  for (const { lng, lat } of members) {
     if (lng < w) w = lng
     if (lng > e) e = lng
     if (lat < s) s = lat
     if (lat > n) n = lat
   }
-  return { bounds: [[w, s], [e, n]], count: coords.length, projectIds, splitZoom }
+  return [[w, s], [e, n]]
 }

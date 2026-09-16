@@ -6,9 +6,9 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 // so the worker is never emitted and 404s in production, leaving a blank
 // map (no vector tiles, no GeoJSON). Hand it the URL Vite actually built.
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
-import { computePlacements, repairOverlaps } from '../utils/placement.js'
+import { placeMarkers, repairOverlaps } from '../utils/placement.js'
 import {
-  buildClusterIndex, screenGroups, groupTarget, bubbleSize, FIT_MAX_ZOOM,
+  buildClusterIndex, screenGroups, groupMembers, splitZoomOf, boundsOf, bubbleSize, FIT_MAX_ZOOM,
 } from '../utils/clusters.js'
 
 /**
@@ -137,8 +137,6 @@ export default function MapCanvas({
   const selectedRef   = useRef(null)
   const compareRef    = useRef(compareSelection)
   const callbacksRef  = useRef({ onSelectProject })
-  const hiddenRef       = useRef(0)
-  const orderRef        = useRef([])
   const watchdogRef     = useRef(null)
   const introDoneRef    = useRef(false)
   const cameraIntentRef = useRef(null)   // last camera we asked for
@@ -275,7 +273,6 @@ export default function MapCanvas({
   const [mapReady, setMapReady]       = useState(false)
   const [introDone, setIntroDone]     = useState(false)
   const [mapType, setMapType]         = useState('map')
-  const [hiddenCount, setHiddenCount] = useState(0)
 
   lookupRef.current = useMemo(() => ({
     byId: new Map(projects.map(p => [p.id, p])),
@@ -502,22 +499,66 @@ export default function MapCanvas({
 
     const groups = screenGroups(index, bbox, map.getZoom(), toScreen, loose)
 
-    // bubbles
-    const liveBubbles = new Set()
-    const fixed = []
-    const entries = []
-    for (const g of groups) {
-      if (g.kind === 'cluster') {
-        liveBubbles.add(g.key)
-        ensureCluster(g, map)
-        const { x, y } = toScreen(g.lng, g.lat)
-        fixed.push({ x, y, ...bubbleSize(g.count) })
-      } else {
-        const p = byId.get(g.projectId)
-        if (!p) continue
-        const { x, y } = toScreen(p.lng, p.lat)
-        entries.push({ id: p.id, x, y, label: pinLabel(p), p })
+    /* Names where they fit, numbers where they don't: every project in view
+       ends up as a name pill, a dot, or counted inside a bubble. */
+    const input = groups.map(g => {
+      const coords = groupMembers(index, g).filter(m => byId.has(m.projectId))
+      const at = toScreen(g.lng, g.lat)
+      return {
+        group: g,
+        coords,
+        key: g.key,
+        kind: g.kind,
+        x: at.x,
+        y: at.y,
+        ...(g.kind === 'cluster' ? bubbleSize(g.count) : {}),
+        members: coords.map(m => {
+          const pt = toScreen(m.lng, m.lat)
+          return { id: m.projectId, x: pt.x, y: pt.y }
+        }),
       }
+    }).filter(g => g.members.length)
+
+    /* Interface floating over the map (list panel / sheet, Compare, the
+       switcher, zoom buttons, an open drawer) — names keep clear of it
+       instead of being cut in half underneath. */
+    const view = map.getContainer().getBoundingClientRect()
+    const obstacles = [...document.querySelectorAll(
+      '.list-panel, .tools-panel, .mapmode--visible, .map-zoom--visible, .pdrawer:not(.pdrawer--closing), .compare-bar',
+    )]
+      .map(el => el.getBoundingClientRect())
+      .filter(r => r.width && r.height)
+      .map(r => ({ x1: r.left - view.left, y1: r.top - view.top, x2: r.right - view.left, y2: r.bottom - view.top }))
+
+    const { bubbles, pins } = placeMarkers(input, {
+      labelOf: (id) => pinLabel(byId.get(id)),
+      priorityIds,
+      rankOf: (id) => rank.get(id) ?? 1e9,
+      obstacles,
+    })
+
+    // bubbles — whatever is left inside a group once names stepped out
+    // (plus any squeezed-in neighbour that joined it)
+    const liveBubbles = new Set()
+    for (const g of input) {
+      const ids = bubbles.get(g.key)
+      if (!ids) continue
+      const members = ids.map(id => {
+        const p = byId.get(id)
+        return { projectId: id, lng: p.lng, lat: p.lat }
+      })
+      const own = new Set(g.coords.map(m => m.projectId))
+      const partial = members.length !== g.coords.length || ids.some(id => !own.has(id))
+      const bubble = {
+        key: partial ? `${g.key}~${members.length}~${ids.reduce((s, id) => s + id, 0)}` : g.key,
+        count: members.length,
+        lng: g.group.lng,
+        lat: g.group.lat,
+        members,
+        splitZoom: partial ? 0 : splitZoomOf(index, g.group),
+      }
+      liveBubbles.add(bubble.key)
+      ensureCluster(bubble, map)
     }
     clusterMarkers.current.forEach((entry, key) => {
       if (liveBubbles.has(key)) return
@@ -525,22 +566,16 @@ export default function MapCanvas({
       clusterMarkers.current.delete(key)
     })
 
-    /* Single projects: name chips → dots → hidden, never stacked and never
-       over a bubble. Priority: selected / compare picks, then the list's
-       current sort order. */
-    entries.sort((a, b) => (rank.get(a.id) ?? 1e9) - (rank.get(b.id) ?? 1e9))
-    const { modes, order, hidden } = computePlacements(entries, { priorityIds, fixed })
-    orderRef.current = order
-
-    const orderRank = new Map(order.map((id, i) => [id, i]))
+    // name pills and dots — priority: selected / compare, then list order
     const livePins = new Set()
-    for (const e of entries) {
-      livePins.add(e.id)
-      ensurePin(e.p, map, modes.get(e.id), e.label)
-      const entry = pinMarkers.current.get(e.id)
+    for (const [id, mode] of pins) {
+      const p = byId.get(id)
+      livePins.add(id)
+      ensurePin(p, map, mode, pinLabel(p))
+      const entry = pinMarkers.current.get(id)
       if (entry) {
-        entry.priority = orderRank.get(e.id) ?? 1e9
-        entry.pinned = priorityIds.includes(e.id)
+        entry.priority = rank.get(id) ?? 1e9
+        entry.pinned = priorityIds.includes(id)
       }
     }
     pinMarkers.current.forEach((entry, id) => {
@@ -548,11 +583,6 @@ export default function MapCanvas({
       entry.marker.remove()
       pinMarkers.current.delete(id)
     })
-
-    if (hidden !== hiddenRef.current) {
-      hiddenRef.current = hidden
-      setHiddenCount(hidden)
-    }
 
     scheduleRepair()
   }
@@ -601,42 +631,46 @@ export default function MapCanvas({
       if (ran) return
       ran = true
 
+      /* Where a marker really sits: its map position plus its rendered size.
+         getBoundingClientRect() would be wrong here — markers ease into
+         place with a CSS transform transition, so right after a move they
+         measure mid-slide and look like they collide when they don't. */
+      const markerRect = (entry) => {
+        const { x, y } = map.project(entry.marker.getLngLat())
+        const w = entry.el.offsetWidth, h = entry.el.offsetHeight
+        return { left: x - w / 2, right: x + w / 2, top: y - h / 2, bottom: y + h / 2 }
+      }
+
       /* Bubbles and the selected / compare pins are never demoted — every
          other pin has to find room around them. */
       const fixedRects = [
-        ...[...clusterMarkers.current.values()].map(e => e.el.getBoundingClientRect()),
+        ...[...clusterMarkers.current.values()].map(markerRect),
         ...[...pinMarkers.current.values()]
           .filter(e => e.pinned && e.mode !== 'hidden')
-          .map(e => e.el.getBoundingClientRect()),
+          .map(markerRect),
       ]
 
       /* Source markers from the LIVE DOM (not a cached order array, which
          can go stale between passes) and sort by the priority stamped on
          each element, so every rendered marker is always checked. */
-      let extra = 0
       for (let attempt = 0; attempt < 3; attempt++) {
         const live = [...pinMarkers.current.entries()]
           .filter(([, e]) => e.mode !== 'hidden' && !e.pinned)
           .sort((a, b) => (a[1].priority ?? 1e9) - (b[1].priority ?? 1e9))
           .map(([id]) => id)
 
-        const demoted = repairOverlaps(live, (id) => {
+        // every project stays on the map: a drifted name shrinks to a dot,
+        // it is never removed
+        const changed = repairOverlaps(live, (id) => {
           const entry = pinMarkers.current.get(id)
           if (!entry) return null
           return {
             mode: entry.mode,
-            rect: () => entry.el.getBoundingClientRect(),
+            rect: () => markerRect(entry),
             setMode: (m) => applyMode(entry, m),
           }
-        }, 6, fixedRects)
-        extra += demoted
-        if (demoted === 0) break   // stable
-      }
-
-      const total = hiddenRef.current + extra
-      if (extra > 0 && total !== hiddenRef.current) {
-        hiddenRef.current = total
-        setHiddenCount(total)
+        }, 6, fixedRects, { canHide: false })
+        if (changed === 0) break   // stable
       }
     }
     requestAnimationFrame(runRepair)
@@ -647,7 +681,12 @@ export default function MapCanvas({
   const applyMode = (entry, mode) => {
     if (entry.mode === mode) return
     entry.mode = mode
-    entry.el.className     = mode === 'pill' ? 'price-pin' : 'dot-pin'
+    /* toggle our classes only — assigning className would wipe MapLibre's
+       `maplibregl-marker` class, which is what positions the marker
+       absolutely; without it pins fall into normal flow and land far from
+       their project */
+    entry.el.classList.toggle('price-pin', mode === 'pill')
+    entry.el.classList.toggle('dot-pin', mode !== 'pill')
     entry.el.textContent   = mode === 'pill' ? entry.label : ''
     entry.el.style.display = mode === 'hidden' ? 'none' : ''
     entry.el.setAttribute('aria-label', entry.aria ?? entry.label)
@@ -698,28 +737,26 @@ export default function MapCanvas({
   /* Tap a bubble → frame exactly the projects it holds, centred in the
      strip of map the broker can see. The zoom never stops short of where
      the bubble breaks apart, so every tap makes progress. */
-  const focusGroup = (group) => {
+  const focusGroup = (bubble) => {
     const map = mapRef.current
-    const index = clusterIndexRef.current
-    if (!map || !index || !group) return
-    const target = groupTarget(index, group)
-    if (!target) return
+    if (!map || !bubble?.members?.length) return
     disarmWatchdog()
     try { map.setProjection({ type: 'mercator' }) } catch { /* ignore */ }
 
+    const bounds = boundsOf(bubble.members)
     const pad = fitPadding()
     let fit = FIT_MAX_ZOOM
     try {
-      const cam = map.cameraForBounds(target.bounds, { padding: pad, maxZoom: FIT_MAX_ZOOM })
+      const cam = map.cameraForBounds(bounds, { padding: pad, maxZoom: FIT_MAX_ZOOM })
       if (cam) fit = cam.zoom
     } catch { /* keep the cap */ }
 
-    const [[w, s], [e, n]] = target.bounds
+    const [[w, s], [e, n]] = bounds
     setCamera(map, {
       kind: 'fly',
       opts: {
         center: [(w + e) / 2, midLat(s, n)],
-        zoom: Math.min(Math.max(fit, target.splitZoom), FIT_MAX_ZOOM),
+        zoom: Math.min(Math.max(fit, bubble.splitZoom), FIT_MAX_ZOOM),
         offset: [(pad.left - pad.right) / 2, (pad.top - pad.bottom) / 2],
         duration: 1400,
         essential: true,
@@ -815,17 +852,6 @@ export default function MapCanvas({
           </svg>
         </button>
       </div>
-
-      {/* Overflow hint — nothing is stacked, so say what's still tucked away */}
-      {introDone && hiddenCount > 0 && (
-        <button
-          type="button"
-          className="zoom-hint"
-          onClick={() => mapRef.current?.zoomIn({ duration: 600 })}
-        >
-          <strong>+{hiddenCount}</strong> more here — zoom in
-        </button>
-      )}
 
       {children}
     </div>
