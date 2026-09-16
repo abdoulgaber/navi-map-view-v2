@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 
-/** Side drawer showing the 2–4 selected projects side by side */
+/** Side drawer showing the selected projects (two or more) side by side */
 export default function CompareDrawer({ items, onClose }) {
   useEffect(() => {
     const handleKey = (e) => { if (e.key === 'Escape') onClose() }

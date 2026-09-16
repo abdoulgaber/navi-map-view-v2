@@ -124,6 +124,7 @@ export default function MapCanvas({
   selectedProject,
   onSelectProject,
   compareSelection,
+  compareFocus = null,   // { id, seq } — a compare pick made from the list
   layout = 'desktop',
   children,
 }) {
@@ -136,6 +137,7 @@ export default function MapCanvas({
   const clusterIndexRef = useRef(null)
   const selectedRef   = useRef(null)
   const compareRef    = useRef(compareSelection)
+  const compareFocusRef = useRef(null)
   const callbacksRef  = useRef({ onSelectProject })
   const watchdogRef     = useRef(null)
   const introDoneRef    = useRef(false)
@@ -789,6 +791,76 @@ export default function MapCanvas({
     syncLayers(); repairPass()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProject, mapReady])
+
+  /* ── project added to compare from the list: fly there ─────────────────
+     The flight is paced by how far it goes: a hop across the neighbourhood
+     is quick, a jump between cities arcs out and back in, never dragging
+     past FLY_MAX_MS. (MapLibre's own `maxDuration` is no use here — a flight
+     longer than it doesn't get capped, it jumps with no animation at all.)
+     The pick is never folded into a bubble, so it lands on its own name
+     pill, which pings to say "this one". */
+  const COMPARE_ZOOM = 13
+  const FLY_MIN_MS = 900
+  const FLY_MAX_MS = 2200
+  compareFocusRef.current = compareFocus
+
+  const pingPin = (id) => {
+    const el = pinMarkers.current.get(id)?.el
+    if (!el) return
+    el.classList.remove('pin--landed')
+    void el.offsetWidth                       // restart the animation
+    el.classList.add('pin--landed')
+    el.addEventListener('animationend', () => el.classList.remove('pin--landed'), { once: true })
+  }
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !mapReady || !compareFocus) return
+    const project = lookupRef.current.byId.get(compareFocus.id)
+    if (!project) return
+    const { seq } = compareFocus
+
+    // on phones the sheet may still be easing down — measure once it settles
+    const timer = setTimeout(() => {
+      disarmWatchdog()
+      try { map.setProjection({ type: 'mercator' }) } catch { /* ignore */ }
+
+      // centre in the visible strip; wider layouts also lose the bottom to
+      // the compare tray
+      const [ox, oy] = focusOffset(false)
+      const tray = layoutRef.current !== 'mobile'
+        ? document.querySelector('.compare-bar')?.getBoundingClientRect()
+        : null
+      const offset = [ox, tray ? oy - Math.round((tray.height + 16) / 2) : oy]
+      const zoom = Math.max(map.getZoom(), COMPARE_ZOOM)
+
+      // how far the camera travels: on-screen distance plus the zoom change
+      const { clientWidth: W, clientHeight: H } = map.getContainer()
+      const at = map.project([project.lng, project.lat])
+      const travel = Math.hypot(at.x - (W / 2 + offset[0]), at.y - (H / 2 + offset[1]))
+      const duration = Math.round(Math.min(FLY_MAX_MS,
+        Math.max(FLY_MIN_MS, 700 + travel * 0.8 + Math.abs(zoom - map.getZoom()) * 160)))
+
+      setCamera(map, {
+        kind: 'fly',
+        opts: {
+          center: [project.lng, project.lat],
+          zoom,
+          offset,
+          duration,
+          curve: 1.42,
+          essential: true,
+        },
+      })
+
+      const land = () => { if (compareFocusRef.current?.seq === seq) pingPin(project.id) }
+      if (map.isMoving()) map.once('moveend', land)
+      else land()   // already there — no flight, ping straight away
+    }, layoutRef.current === 'mobile' ? 340 : 0)
+
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compareFocus, mapReady])
 
   /* ── compare selection: re-run sync so pin classes stay accurate ───── */
   useEffect(() => {

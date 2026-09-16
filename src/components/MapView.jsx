@@ -45,7 +45,9 @@ export default function MapView({ filters, search, sort }) {
   const [compareMode, setCompareMode] = useState(false)
   const [compareSel,  setCompareSel]  = useState([])
   const [compareOpen, setCompareOpen] = useState(false)
-  const [compareMax,  setCompareMax]  = useState(false)
+  /* A project added to compare from the LIST is flown to on the map, so the
+     broker sees where it sits (picks made on the map are already in view) */
+  const [compareFocus, setCompareFocus] = useState(null)   // { id, seq }
 
   const listRef = useRef(null)
 
@@ -89,16 +91,9 @@ export default function MapView({ filters, search, sort }) {
   )
 
   /* ── selection & compare routing ───────────────────────────────────── */
+  // no cap on how many projects can be compared
   const toggleCompareItem = useCallback((id) => {
-    setCompareSel(sel => {
-      if (sel.includes(id)) return sel.filter(x => x !== id)
-      if (sel.length >= 4) {
-        setCompareMax(true)
-        setTimeout(() => setCompareMax(false), 1500)
-        return sel
-      }
-      return [...sel, id]
-    })
+    setCompareSel(sel => (sel.includes(id) ? sel.filter(x => x !== id) : [...sel, id]))
   }, [])
 
   const handleProjectClick = useCallback((project) => {
@@ -111,6 +106,16 @@ export default function MapView({ filters, search, sort }) {
       ?.querySelector(`[data-id="${project.id}"]`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   }, [compareMode, toggleCompareItem, isCompact])
+
+  /* List cards: in compare mode, a project being ADDED also flies the map to
+     it. On phones a full-height sheet eases down to half so the flight shows. */
+  const handleCardClick = useCallback((project) => {
+    if (compareMode && !compareSel.includes(project.id)) {
+      setCompareFocus(f => ({ id: project.id, seq: (f?.seq ?? 0) + 1 }))
+      if (isCompact) setSheet(s => (s === 'full' ? 'half' : s))
+    }
+    handleProjectClick(project)
+  }, [compareMode, compareSel, isCompact, handleProjectClick])
 
   /* Let the panel play its 400ms exit before it leaves the tree */
   const DRAWER_ANIM_MS = 400
@@ -206,7 +211,7 @@ export default function MapView({ filters, search, sort }) {
                 project={project}
                 active={selectedProject?.id === project.id}
                 compareSelected={compareSel.includes(project.id)}
-                onClick={handleProjectClick}
+                onClick={handleCardClick}
               />
             </div>
           ))}
@@ -224,6 +229,7 @@ export default function MapView({ filters, search, sort }) {
         selectedProject={selectedProject}
         onSelectProject={handleProjectClick}
         compareSelection={compareSel}
+        compareFocus={compareFocus}
         layout={isMobile ? 'mobile' : isCompact ? 'tablet' : 'desktop'}
       >
         {/* Compare — NAVI hand-off button: white when idle, blue with a
@@ -246,7 +252,6 @@ export default function MapView({ filters, search, sort }) {
         <CompareBar
           visible={compareMode}
           items={compareItems}
-          maxHit={compareMax}
           onRemove={toggleCompareItem}
           onClear={() => setCompareSel([])}
           onView={() => setCompareOpen(true)}

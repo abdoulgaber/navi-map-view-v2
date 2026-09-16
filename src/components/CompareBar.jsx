@@ -1,15 +1,14 @@
 /** Bottom bar shown in compare mode: selection chips + actions */
-export default function CompareBar({ visible, items, maxHit, onRemove, onClear, onView }) {
+export default function CompareBar({ visible, items, onRemove, onClear, onView }) {
   if (!visible) return null
 
   return (
     <div className="compare-bar">
       <div className="compare-chips">
-        {maxHit && <span className="compare-hint compare-hint--warn">Max 4 projects — remove one to add another</span>}
-        {!maxHit && items.length === 0 && (
-          <span className="compare-hint">Tap 2–4 projects on the map or list to compare</span>
+        {items.length === 0 && (
+          <span className="compare-hint">Tap 2 or more projects on the map or list to compare</span>
         )}
-        {!maxHit && items.map(p => (
+        {items.map(p => (
           <span key={p.id} className="compare-chip">
             {p.name}
             <button type="button" onClick={() => onRemove(p.id)}>×</button>
