@@ -3,7 +3,9 @@
  *
  * Guarantees, at every zoom level:
  *  - no two rendered markers overlap (each keeps a breathing margin)
- *  - the most in-demand areas keep the readable price pills
+ *  - no pin covers a cluster bubble
+ *  - the selected / compare projects and the top of the list keep the
+ *    readable name pills
  *  - anything that cannot breathe is hidden rather than stacked
  *
  * Pure function of screen coordinates → render modes, so it can be unit
@@ -29,29 +31,34 @@ const rectAt = (pt, w, h) => ({
 })
 
 /**
- * @param entries    [{ id, x, y, label, area }] — already viewport-filtered
- * @param popularity Map<area, projectCount> — busier areas win pills
- * @param selectedId the project that must always keep its pill
+ * @param entries      [{ id, x, y, label }] — viewport-filtered, in list order
+ * @param priorityIds  selected / compare projects: placed first and never
+ *                     hidden (they may sit over a bubble, never vanish)
+ * @param fixed        [{ x, y, w, h }] — cluster bubbles every other pin
+ *                     has to find room around
  * @returns { modes, order, hidden } — `order` is the priority sequence,
  *          reused by the DOM repair pass so demotions stay consistent.
  */
-export function computePlacements(entries, popularity = new Map(), selectedId = null) {
-  /* Priority: selected → busiest area → incoming (list sort) order */
+export function computePlacements(entries, { priorityIds = [], fixed = [] } = {}) {
+  /* Priority: selected / compare picks → incoming (list sort) order */
+  const rank = new Map(priorityIds.map((id, i) => [id, i]))
   const ordered = entries.map((e, i) => ({ ...e, i })).sort((a, b) => {
-    if (a.id === selectedId) return -1
-    if (b.id === selectedId) return 1
-    const pd = (popularity.get(b.area) ?? 0) - (popularity.get(a.area) ?? 0)
+    const pd = (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity)
     return pd !== 0 ? pd : a.i - b.i
   })
 
+  const obstacles = fixed.map(f => rectAt(f, f.w + PILL_GAP, f.h + PILL_GAP))
   const placed = []
   const modes  = new Map()
   const leftovers = []
+  const blocked = (rect, e) =>
+    placed.some(r => intersects(rect, r)) ||
+    (!rank.has(e.id) && obstacles.some(r => intersects(rect, r)))
 
   // Tier 1 — name chips
   for (const e of ordered) {
     const rect = rectAt(e, estimatePillW(e.label) + PILL_GAP, PILL_H + PILL_GAP)
-    if (placed.some(r => intersects(rect, r))) {
+    if (blocked(rect, e)) {
       leftovers.push(e)
     } else {
       placed.push(rect)
@@ -59,12 +66,12 @@ export function computePlacements(entries, popularity = new Map(), selectedId = 
     }
   }
 
-  // Tier 2 — dots (tested against chips *and* other dots)
+  // Tier 2 — dots (tested against chips, dots *and* bubbles)
   const dotBox = DOT_SIZE + DOT_GAP + HOVER_ROOM
   let hidden = 0
   for (const e of leftovers) {
     const rect = rectAt(e, dotBox, dotBox)
-    if (placed.some(r => intersects(rect, r))) {
+    if (blocked(rect, e) && !rank.has(e.id)) {
       modes.set(e.id, 'hidden')   // Tier 3 — never stack
       hidden++
     } else {
@@ -114,35 +121,4 @@ export function repairOverlaps(order, get, gap = 6, fixedRects = []) {
     accepted.push(box)
   }
   return hidden
-}
-
-/**
- * Which area chips to label on the map.
- *
- * Busiest areas win, off-screen ones are skipped, anything that would
- * touch an already placed chip is dropped, and the total is capped so a
- * country view shows a handful of landmarks instead of a wall of labels.
- *
- * @param items [{ id, count, rect }] — rect is viewport-relative
- * @param view  the map container's rect, in the same coordinate space
- * @returns Set of ids to show
- */
-export function chooseChips(items, view, { max = 7, gap = 6 } = {}) {
-  const sorted = [...items].sort((a, b) => b.count - a.count)
-  const taken = []
-  const shown = new Set()
-
-  for (const item of sorted) {
-    if (shown.size >= max) break
-    const r = item.rect
-    if (r.right < view.left || r.left > view.right ||
-        r.bottom < view.top || r.top > view.bottom) continue
-
-    const box = { x1: r.left - gap, y1: r.top - gap, x2: r.right + gap, y2: r.bottom + gap }
-    if (taken.some(t => intersects(box, t))) continue
-
-    taken.push(box)
-    shown.add(item.id)
-  }
-  return shown
 }

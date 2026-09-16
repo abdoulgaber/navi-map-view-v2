@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Map as MapGL, Marker, setWorkerUrl } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 // MapLibre v6 resolves its worker at runtime via a template literal
@@ -6,16 +6,19 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 // so the worker is never emitted and 404s in production, leaving a blank
 // map (no vector tiles, no GeoJSON). Hand it the URL Vite actually built.
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
-import { computePlacements, repairOverlaps, chooseChips } from '../utils/placement.js'
-import { getAreaBoundary, boundsOfPoints, boundaryFeatures } from '../utils/boundaries.js'
+import { computePlacements, repairOverlaps } from '../utils/placement.js'
+import {
+  buildClusterIndex, screenGroups, groupTarget, bubbleSize, FIT_MAX_ZOOM,
+} from '../utils/clusters.js'
 
 /**
  * MapCanvas — MapLibre GL map with:
  *  - Globe intro flying into Egypt on first load
- *  - Highlighted zone areas + count badges at country zoom
- *  - Airbnb-style pin decluttering at city zoom: price pills are placed
- *    by screen-space collision with a breathing threshold; pins that
- *    don't fit render as small dots and promote back to pills on zoom-in
+ *  - Number clusters: nearby projects share one bubble showing how many
+ *    they are; tapping it frames exactly those projects, where it splits
+ *    into smaller bubbles and, eventually, single projects
+ *  - Single projects as name pills, placed by screen-space collision;
+ *    pins that don't fit render as small dots and promote back on zoom-in
  *  - Hover card per pin/dot, Map/Satellite toggle, compare highlighting
  */
 
@@ -41,9 +44,8 @@ const SAT_STYLE = {
 const NORTH_EGYPT_BOUNDS = [[27.6, 29.25], [32.75, 31.75]]  // [[w,s],[e,n]]
 const NORTH_EGYPT_VIEW   = { center: [30.2, 30.5], zoom: 6.9 } // instant fallback
 const GLOBE_VIEW  = { center: [8, 15], zoom: 1.4 }
-const PIN_ZOOM    = 8.3
-const ZONE_ZOOM   = 10.8
 const INTRO_MS    = 3200
+const MARGIN      = 80   // px past the viewport edge that markers are kept for
 
 /* The floating list panel covers the left edge — nudge camera targets into
    the visible half of the map. NOTE: use `offset` (screen px), never
@@ -55,12 +57,10 @@ const PANEL_OFFSET = [224, 0]
    project in the gap that is left between the panel and the drawer */
 const DRAWER_W = 560
 
-const ZONES_SRC = 'zones-src'
-
 /* Fit padding — whatever chrome covers the map on this layout. Desktop and
    tablet lose their left edge to the panel; phones lose the bottom to the
    sheet. Values are clamped so a fit can never exceed the viewport. */
-const FIT_PADDING = { left: 460, top: 70, right: 60, bottom: 90 }
+const FIT_PADDING = { left: 460, top: 80, right: 60, bottom: 90 }
 
 const shortPrice = (v) =>
   v >= 1_000_000
@@ -113,31 +113,14 @@ const hoverCardHTML = (p) => {
   </article>`
 }
 
-/* Real administrative borders for every area OSM has one for. Areas
-   without an official polygon are intentionally left unshaded. */
-function drawZoneAreas(map, zones) {
-  const data = boundaryFeatures(zones.map(z => z.area))
-  const src = map.getSource(ZONES_SRC)
-  if (src) { src.setData(data); return }
-  map.addSource(ZONES_SRC, { type: 'geojson', data })
-  /* Outline only — no wash over the map, the way Google draws an
-     administrative boundary, in NAVI blue. */
-  map.addLayer({
-    id: 'zone-line',
-    type: 'line',
-    source: ZONES_SRC,
-    layout: { 'line-join': 'round' },
-    paint: {
-      'line-color': '#4C64FF',
-      'line-width': ['interpolate', ['linear'], ['zoom'], 5, 1.2, 10, 1.8, 14, 2.2],
-      'line-opacity': 0.75,
-    },
-  })
+/* Mercator midpoint of a latitude span — what the map treats as "centre" */
+const midLat = (s, n) => {
+  const y = (lat) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360))
+  return (Math.atan(Math.exp((y(s) + y(n)) / 2)) * 360) / Math.PI - 90
 }
 
 export default function MapCanvas({
   projects,
-  zones,
   selectedProject,
   onSelectProject,
   compareSelection,
@@ -146,18 +129,16 @@ export default function MapCanvas({
 }) {
   const containerRef  = useRef(null)
   const mapRef        = useRef(null)
-  const zoneMarkers   = useRef([])
+  const clusterMarkers = useRef(new Map())  // group key → { marker, el, group }
   const pinMarkers     = useRef(new Map())  // project.id → { marker, el, mode }
   const hoverCardRef  = useRef(null)
-  const projectsRef   = useRef(projects)
-  const zonesRef      = useRef(zones)
+  const lookupRef     = useRef({ byId: new Map(), rank: new Map() })
+  const clusterIndexRef = useRef(null)
   const selectedRef   = useRef(null)
   const compareRef    = useRef(compareSelection)
   const callbacksRef  = useRef({ onSelectProject })
   const hiddenRef       = useRef(0)
   const orderRef        = useRef([])
-  const styleReadyRef   = useRef(false)  // set by the style.load event
-  const pendingDrawRef  = useRef([])
   const watchdogRef     = useRef(null)
   const introDoneRef    = useRef(false)
   const cameraIntentRef = useRef(null)   // last camera we asked for
@@ -236,38 +217,6 @@ export default function MapCanvas({
   }
 
 
-  /* ── Area chips: few, stable, never stacked ───────────────────────────
-     Like Nawy's map, only the areas that matter are labelled: the busiest
-     ones that fit, capped so a country view never turns into a wall of
-     labels. Crucially this runs ONLY when the camera has settled — running
-     it mid-gesture is what made chips flicker while zooming. */
-  const MAX_CHIPS = 7
-
-  const layoutZoneChips = () => {
-    const map = mapRef.current
-    if (!map) return
-    const chips = zoneMarkers.current
-      .map(m => m.getElement())
-      .filter(el => el.style.display !== 'none')
-    if (!chips.length) return
-
-    /* No viewport to measure against (hidden tab, collapsed pane): leave
-       every chip exactly as it is rather than hiding the lot. */
-    const view = map.getContainer().getBoundingClientRect()
-    if (!view.width || !view.height) return
-
-    chips.forEach(el => { el.style.visibility = '' })
-    const items = chips.map((el, i) => ({
-      id: i,
-      count: Number(el.dataset.count || 0),
-      rect: el.getBoundingClientRect(),
-    }))
-    const shown = chooseChips(items, view, { max: MAX_CHIPS })
-    chips.forEach((el, i) => {
-      el.style.visibility = shown.has(i) ? '' : 'hidden'
-    })
-  }
-
   /* Where a selected project should sit: dead centre of the strip the
      broker can actually see — between the list panel and the detail
      drawer — never tucked behind either of them. */
@@ -302,10 +251,11 @@ export default function MapCanvas({
     const map = mapRef.current
     if (!map) return { top: 24, right: 24, bottom: 24, left: 24 }
     const { clientWidth: W, clientHeight: H } = map.getContainer()
+    // top clears the Compare / Map-Satellite row so no bubble lands under it
     const raw = layoutRef.current === 'mobile'
-      ? { top: 40, right: 24, bottom: Math.round(H * 0.42), left: 24 }
+      ? { top: 72, right: 24, bottom: Math.round(H * 0.42), left: 24 }
       : layoutRef.current === 'tablet'
-        ? { top: 60, right: 40, bottom: 70, left: 360 }
+        ? { top: 76, right: 40, bottom: 70, left: 360 }
         : FIT_PADDING
     return {
       top:    Math.min(raw.top,    Math.max(0, H / 2 - 40)),
@@ -322,21 +272,27 @@ export default function MapCanvas({
     clearTimeout(watchdogRef.current)
   }
 
-  /* Sources/layers may only be added once the style has loaded. Track that
-     with the style.load EVENT — never with isStyleLoaded(), which stays
-     false whenever tiles cannot finish (offline, blocked worker, slow
-     network) and would silently suppress our layers forever. */
-  const whenStyleReady = (fn) => {
-    if (styleReadyRef.current) { fn(); return }
-    pendingDrawRef.current.push(fn)
-  }
   const [mapReady, setMapReady]       = useState(false)
   const [introDone, setIntroDone]     = useState(false)
   const [mapType, setMapType]         = useState('map')
   const [hiddenCount, setHiddenCount] = useState(0)
 
-  projectsRef.current  = projects
-  zonesRef.current     = zones
+  lookupRef.current = useMemo(() => ({
+    byId: new Map(projects.map(p => [p.id, p])),
+    rank: new Map(projects.map((p, i) => [p.id, i])),   // list order
+  }), [projects])
+
+  /* Clusters are rebuilt whenever the project set changes — and whenever a
+     project is selected or picked for compare: those are always drawn on
+     their own, never folded into a bubble. */
+  const looseKey = [selectedProject?.id, ...(compareSelection ?? [])].join(',')
+  const clusterIndex = useMemo(() => {
+    const loose = new Set([selectedProject?.id, ...(compareSelection ?? [])].filter(id => id != null))
+    return buildClusterIndex(projects, loose)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projects, looseKey])
+  clusterIndexRef.current = clusterIndex
+
   selectedRef.current  = selectedProject
   compareRef.current   = compareSelection
   callbacksRef.current   = { onSelectProject }
@@ -358,6 +314,12 @@ export default function MapCanvas({
       window.__naviDebug = {
         intent:  () => cameraIntentRef.current,
         hadSize: () => hadSizeRef.current,
+        markers: () => ({
+          bubbles: [...clusterMarkers.current.values()].map(e => ({
+            count: e.group.count, lng: e.group.lng, lat: e.group.lat,
+          })),
+          pins: [...pinMarkers.current.entries()].map(([id, e]) => ({ id, mode: e.mode })),
+        }),
       }
     }
 
@@ -383,12 +345,12 @@ export default function MapCanvas({
         })
         map.once('moveend', () => {
           /* Globe is only for the cinematic entry. Everything after it —
-             tiles, zone fills, hours of broker panning — runs on mercator,
+             tiles, bubbles, hours of broker panning — runs on mercator,
              which is the widely-supported path on every GPU/driver. */
           try { map.setProjection({ type: 'mercator' }) } catch { /* ignore */ }
           disarmWatchdog()
           setIntroDone(true)
-          syncLayers(); layoutZoneChips()
+          syncLayers()
         })
         // never leave the UI chrome hidden — or the map stuck on globe —
         // if the camera event is missed
@@ -396,7 +358,7 @@ export default function MapCanvas({
           try { map.setProjection({ type: 'mercator' }) } catch { /* ignore */ }
           disarmWatchdog()
           setIntroDone(true)
-          syncLayers(); layoutZoneChips()
+          syncLayers()
         }, INTRO_MS + 1500)
       }, 400)
 
@@ -411,37 +373,26 @@ export default function MapCanvas({
           try { map.setProjection({ type: 'mercator' }) } catch { /* ignore */ }
           map.jumpTo({ ...NORTH_EGYPT_VIEW })
           setIntroDone(true)
-          syncLayers(); layoutZoneChips()
+          syncLayers()
         }
       }, INTRO_MS + 2600)
     }
 
     map.on('style.load', () => {
       try { map.setProjection({ type: 'globe' }) } catch { /* raster fallback */ }
-      styleReadyRef.current = true
-      drawZoneAreas(map, zonesRef.current)
-      // flush anything that asked to draw before the style was ready
-      const pending = pendingDrawRef.current
-      pendingDrawRef.current = []
-      pending.forEach(fn => fn())
       start()
     })
     map.on('load', start)
     const startFallback = setTimeout(start, 5000)
 
-    // Sync continuously while moving (rAF-throttled) so pins populate
-    // during pans/zooms, plus a final pass when the camera settles
-    let raf = null
-    map.on('move', () => {
-      if (raf) return
-      raf = requestAnimationFrame(() => { raf = null; syncLayers() })
-    })
+    /* Markers ride along with the camera on their own; bubbles and pills
+       are re-decided once it settles (see syncLayers). */
     map.on('movestart', () => { movingRef.current = true; hideHoverCard() })
-    map.on('moveend', () => { movingRef.current = false; syncLayers(); repairPass(); layoutZoneChips() })
+    map.on('moveend', () => { movingRef.current = false; syncLayers(); repairPass() })
     /* 'idle' is the only signal that the camera has settled AND every
        marker has been positioned — decluttering before that measures
        stale positions and can hide labels that do not actually collide. */
-    map.on('idle', () => { syncLayers(); repairPass(); layoutZoneChips() })
+    map.on('idle', () => { syncLayers(); repairPass() })
 
     /* Recover from a zero-sized container. MapLibre drops camera commands
        while it has no box, so the intro (or an area fit) can be lost; when
@@ -466,7 +417,7 @@ export default function MapCanvas({
         cameraIntentRef.current = { ...intent, applied: true }
         disarmWatchdog()
         setIntroDone(true)
-        syncLayers(); layoutZoneChips()
+        syncLayers()
       }
       return true
     }
@@ -486,7 +437,6 @@ export default function MapCanvas({
       clearTimeout(startFallback)
       clearTimeout(watchdogRef.current)
       clearTimeout(repairTimer.current)
-      if (raf) cancelAnimationFrame(raf)
       hideHoverCard()
       map.remove()
       mapRef.current = null
@@ -498,100 +448,133 @@ export default function MapCanvas({
   useEffect(() => {
     const map = mapRef.current
     if (!map || !mapReady) return
-    styleReadyRef.current = false   // setStyle wipes sources; style.load re-arms
     map.setStyle(mapType === 'sat' ? SAT_STYLE : MAP_STYLE)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mapType])
 
-  /* ── declutter pass: pills where they fit, dots where they don't ───── */
+  /* ── what to draw: number bubbles first, then name pills / dots ────── */
+  const clearMarkers = () => {
+    clusterMarkers.current.forEach(entry => entry.marker.remove())
+    clusterMarkers.current.clear()
+    pinMarkers.current.forEach(entry => entry.marker.remove())
+    pinMarkers.current.clear()
+  }
+
   const syncLayers = () => {
     const map = mapRef.current
-    if (!map) return
-    const showPins = map.getZoom() >= PIN_ZOOM
+    const index = clusterIndexRef.current
+    if (!map || !index) return
 
-    zoneMarkers.current.forEach(m => {
-      const el = m.getElement()
-      /* No chips over the opening flight: they appear once the intro is
-         done AND the camera has actually left globe scale — at globe zoom
-         every area lands on the same few pixels anyway. */
-      const landed = introDoneRef.current && map.getZoom() > GLOBE_VIEW.zoom + 1.5
-      el.style.display = (!landed || showPins) ? 'none' : 'flex'
-    })
-
-    if (!showPins) {
-      pinMarkers.current.forEach(entry => entry.marker.remove())
-      pinMarkers.current.clear()
+    /* Nothing over the opening flight: markers appear once the intro is
+       done AND the camera has left globe scale. */
+    const landed = introDoneRef.current && map.getZoom() > GLOBE_VIEW.zoom + 1.5
+    if (!landed) {
+      clearMarkers()
       hideHoverCard()
       return
     }
 
-    // Visibility by SCREEN position (projection-agnostic — geographic
-    // bounds are unreliable under globe projection + camera padding)
+    /* Markers already travel with the camera. Re-grouping on every frame
+       of a pinch or pan is what makes a map flicker, so bubbles and pills
+       are only re-decided once the camera settles (moveend / idle). */
+    if (movingRef.current) return
+
     const { clientWidth: W, clientHeight: H } = map.getContainer()
-    const MARGIN = 80
-    const inView = []
-    for (const p of projectsRef.current) {
-      const pt = map.project([p.lng, p.lat])
-      if (pt.x < -MARGIN || pt.x > W + MARGIN || pt.y < -MARGIN || pt.y > H + MARGIN) continue
-      inView.push({ p, pt })
-    }
+    if (!W || !H) return
 
+    const nw = map.unproject([-MARGIN, -MARGIN])
+    const se = map.unproject([W + MARGIN, H + MARGIN])
+    const bbox = [
+      Math.max(-180, nw.lng), Math.max(-85, se.lat),
+      Math.min(180, se.lng),  Math.min(85, nw.lat),
+    ]
+    const inBox = (p) => p.lng >= bbox[0] && p.lng <= bbox[2] && p.lat >= bbox[1] && p.lat <= bbox[3]
+    const toScreen = (lng, lat) => map.project([lng, lat])
+
+    const { byId, rank } = lookupRef.current
+    const selectedId = selectedRef.current?.id ?? null
+    const priorityIds = [...new Set([selectedId, ...(compareRef.current ?? [])])]
+      .filter(id => byId.has(id))
+    const loose = priorityIds
+      .map(id => byId.get(id))
+      .filter(inBox)
+      .map(p => ({ projectId: p.id, lng: p.lng, lat: p.lat }))
+
+    const groups = screenGroups(index, bbox, map.getZoom(), toScreen, loose)
+
+    // bubbles
+    const liveBubbles = new Set()
+    const fixed = []
     const entries = []
-    const byId    = new Map()
-    for (const { p, pt } of inView) {
-      const label = pinLabel(p)
-      entries.push({ id: p.id, x: pt.x, y: pt.y, label, area: p.location })
-      byId.set(p.id, { p, label })
-    }
-
-    const visible = new Set(byId.keys())
-
-    /* Re-deciding which chips are labels vs dots on every frame of a pinch
-       or pan is what makes the map flicker. Markers already move with the
-       camera on their own, so mid-gesture we only add/remove what enters or
-       leaves the viewport and leave every existing decision alone; the full
-       placement runs once the camera settles. */
-    if (movingRef.current) {
-      for (const [id, { p, label }] of byId) {
-        if (!pinMarkers.current.has(id)) ensurePin(p, map, 'hidden', label)
+    for (const g of groups) {
+      if (g.kind === 'cluster') {
+        liveBubbles.add(g.key)
+        ensureCluster(g, map)
+        const { x, y } = toScreen(g.lng, g.lat)
+        fixed.push({ x, y, ...bubbleSize(g.count) })
+      } else {
+        const p = byId.get(g.projectId)
+        if (!p) continue
+        const { x, y } = toScreen(p.lng, p.lat)
+        entries.push({ id: p.id, x, y, label: pinLabel(p), p })
       }
-      pinMarkers.current.forEach((entry, id) => {
-        if (!visible.has(id)) {
-          entry.marker.remove()
-          pinMarkers.current.delete(id)
-        }
-      })
-      return
     }
+    clusterMarkers.current.forEach((entry, key) => {
+      if (liveBubbles.has(key)) return
+      entry.marker.remove()
+      clusterMarkers.current.delete(key)
+    })
 
-    /* Name chips → dots → hidden, never stacked. Priority: selected
-       project, then busiest areas (density = broker demand), then the
-       list's current sort order. */
-    const popularity = new Map(zonesRef.current.map(z => [z.area, z.count]))
-    const { modes, order, hidden } = computePlacements(entries, popularity, selectedRef.current?.id)
+    /* Single projects: name chips → dots → hidden, never stacked and never
+       over a bubble. Priority: selected / compare picks, then the list's
+       current sort order. */
+    entries.sort((a, b) => (rank.get(a.id) ?? 1e9) - (rank.get(b.id) ?? 1e9))
+    const { modes, order, hidden } = computePlacements(entries, { priorityIds, fixed })
     orderRef.current = order
 
-    const rank = new Map(order.map((id, i) => [id, i]))
-    for (const [id, mode] of modes) {
-      const { p, label } = byId.get(id)
-      ensurePin(p, map, mode, label)
-      const entry = pinMarkers.current.get(id)
-      if (entry) entry.priority = rank.get(id) ?? 1e9
+    const orderRank = new Map(order.map((id, i) => [id, i]))
+    const livePins = new Set()
+    for (const e of entries) {
+      livePins.add(e.id)
+      ensurePin(e.p, map, modes.get(e.id), e.label)
+      const entry = pinMarkers.current.get(e.id)
+      if (entry) {
+        entry.priority = orderRank.get(e.id) ?? 1e9
+        entry.pinned = priorityIds.includes(e.id)
+      }
     }
+    pinMarkers.current.forEach((entry, id) => {
+      if (livePins.has(id)) return
+      entry.marker.remove()
+      pinMarkers.current.delete(id)
+    })
 
     if (hidden !== hiddenRef.current) {
       hiddenRef.current = hidden
       setHiddenCount(hidden)
     }
 
-    pinMarkers.current.forEach((entry, id) => {
-      if (!visible.has(id)) {
-        entry.marker.remove()
-        pinMarkers.current.delete(id)
-      }
-    })
-
     scheduleRepair()
+  }
+
+  /* One marker per bubble, keyed by the projects it holds — a bubble that
+     survives a settle keeps its element, so nothing flashes. */
+  const ensureCluster = (group, map) => {
+    const existing = clusterMarkers.current.get(group.key)
+    if (existing) { existing.group = group; return }
+
+    const el = document.createElement('button')
+    el.type = 'button'
+    el.className = 'cluster-pin'
+    el.innerHTML = `<strong>${group.count}</strong>`
+    el.setAttribute('aria-label', `${group.count} projects — zoom in`)
+    const entry = { el, group, marker: null }
+    el.addEventListener('click', (e) => {
+      e.stopPropagation()
+      focusGroup(entry.group)
+    })
+    entry.marker = new Marker({ element: el }).setLngLat([group.lng, group.lat]).addTo(map)
+    clusterMarkers.current.set(group.key, entry)
   }
 
   /* Any sync can promote a marker back to a pill (model-based), so the
@@ -609,7 +592,6 @@ export default function MapCanvas({
   const repairPass = () => {
     const map = mapRef.current
     if (!map) return
-    const pinsShown = map.getZoom() >= PIN_ZOOM
 
     /* Run after the browser has laid the markers out. rAF is the right
        signal, but it is throttled in background/embedded views — a timeout
@@ -618,7 +600,15 @@ export default function MapCanvas({
     const runRepair = () => {
       if (ran) return
       ran = true
-      if (!pinsShown) return   // badges handled above; no chips at this zoom
+
+      /* Bubbles and the selected / compare pins are never demoted — every
+         other pin has to find room around them. */
+      const fixedRects = [
+        ...[...clusterMarkers.current.values()].map(e => e.el.getBoundingClientRect()),
+        ...[...pinMarkers.current.values()]
+          .filter(e => e.pinned && e.mode !== 'hidden')
+          .map(e => e.el.getBoundingClientRect()),
+      ]
 
       /* Source markers from the LIVE DOM (not a cached order array, which
          can go stale between passes) and sort by the priority stamped on
@@ -626,7 +616,7 @@ export default function MapCanvas({
       let extra = 0
       for (let attempt = 0; attempt < 3; attempt++) {
         const live = [...pinMarkers.current.entries()]
-          .filter(([, e]) => e.mode !== 'hidden')
+          .filter(([, e]) => e.mode !== 'hidden' && !e.pinned)
           .sort((a, b) => (a[1].priority ?? 1e9) - (b[1].priority ?? 1e9))
           .map(([id]) => id)
 
@@ -638,7 +628,7 @@ export default function MapCanvas({
             rect: () => entry.el.getBoundingClientRect(),
             setMode: (m) => applyMode(entry, m),
           }
-        })
+        }, 6, fixedRects)
         extra += demoted
         if (demoted === 0) break   // stable
       }
@@ -694,47 +684,46 @@ export default function MapCanvas({
     entry.el.classList.toggle('price-pin--compare', compareRef.current?.includes(project.id))
   }
 
-  /* ── zone areas + badges ───────────────────────────────────────────── */
+  /* ── new cluster index (projects / selection / compare) → new bubbles ─
+     Declared before the selection effect so bubbles are rebuilt before a
+     selection starts flying the camera. */
   useEffect(() => {
-    const map = mapRef.current
-    if (!map || !mapReady) return
-
-    whenStyleReady(() => drawZoneAreas(map, zones))
-
-    zoneMarkers.current.forEach(m => m.remove())
-    zoneMarkers.current = []
-
-    for (const zone of zones) {
-      const el = document.createElement('button')
-      el.className = 'zone-badge'
-      el.type = 'button'
-      el.innerHTML = `<strong>${zone.count}</strong><span>${zone.area}</span>`
-      el.dataset.count = zone.count
-      // tapping an area frames it — no selection state, just the camera
-      el.addEventListener('click', () => focusArea(zone))
-      zoneMarkers.current.push(
-        new Marker({ element: el }).setLngLat([zone.lng, zone.lat]).addTo(map)
-      )
-    }
-    syncLayers(); layoutZoneChips(); repairPass()
+    if (!mapReady) return
+    clusterMarkers.current.forEach(entry => entry.marker.remove())
+    clusterMarkers.current.clear()
+    syncLayers(); repairPass()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [zones, mapReady])
+  }, [clusterIndex, mapReady])
 
-  /* Frame an area: its real border when OSM has one, otherwise the spread
-     of its projects. Pure camera work — nothing is "selected". */
-  const focusArea = (zone) => {
+  /* Tap a bubble → frame exactly the projects it holds, centred in the
+     strip of map the broker can see. The zoom never stops short of where
+     the bubble breaks apart, so every tap makes progress. */
+  const focusGroup = (group) => {
     const map = mapRef.current
-    if (!map) return
+    const index = clusterIndexRef.current
+    if (!map || !index || !group) return
+    const target = groupTarget(index, group)
+    if (!target) return
     disarmWatchdog()
     try { map.setProjection({ type: 'mercator' }) } catch { /* ignore */ }
 
-    const boundary = getAreaBoundary(zone.area)
-    const bounds = boundary?.bounds ?? boundsOfPoints(zone.points ?? [])
-    if (!bounds) return
+    const pad = fitPadding()
+    let fit = FIT_MAX_ZOOM
+    try {
+      const cam = map.cameraForBounds(target.bounds, { padding: pad, maxZoom: FIT_MAX_ZOOM })
+      if (cam) fit = cam.zoom
+    } catch { /* keep the cap */ }
+
+    const [[w, s], [e, n]] = target.bounds
     setCamera(map, {
-      kind: 'fit',
-      bounds,
-      opts: { padding: fitPadding(), duration: 1400, maxZoom: 14, essential: true },
+      kind: 'fly',
+      opts: {
+        center: [(w + e) / 2, midLat(s, n)],
+        zoom: Math.min(Math.max(fit, target.splitZoom), FIT_MAX_ZOOM),
+        offset: [(pad.left - pad.right) / 2, (pad.top - pad.bottom) / 2],
+        duration: 1400,
+        essential: true,
+      },
     })
   }
 

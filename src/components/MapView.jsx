@@ -1,5 +1,5 @@
 import { useState, useRef, useMemo, useCallback, useEffect } from 'react'
-import { projects, BASE_LOCATIONS } from '../data/projects.js'
+import { projects } from '../data/projects.js'
 import { applyFilters } from './FilterBar.jsx'
 import { sortProjects } from './ControlsBar.jsx'
 import ProjectCard from './ProjectCard.jsx'
@@ -72,7 +72,7 @@ export default function MapView({ filters, search, sort }) {
     Commercial:  baseFiltered.filter(CATEGORY_MATCH.Commercial).length,
   }), [baseFiltered])
 
-  /* Everything in the chosen category — drives the zone badges */
+  /* Everything in the chosen category — the list and the map's clusters */
   const inCategory = useMemo(
     () => sortProjects(baseFiltered.filter(CATEGORY_MATCH[category]), sort),
     [baseFiltered, category, sort],
@@ -82,20 +82,6 @@ export default function MapView({ filters, search, sort }) {
 
   // restart paging whenever the result set changes underneath the panel
   useEffect(() => { setVisibleCount(PAGE) }, [filtered])
-
-  const zones = useMemo(() =>
-    BASE_LOCATIONS
-      .map(loc => {
-        const inZone = inCategory.filter(p => p.location === loc.area)
-        return {
-          ...loc,
-          count: inZone.length,
-          points: inZone.map(p => [p.lng, p.lat]),
-        }
-      })
-      .filter(z => z.count > 0),
-    [inCategory],
-  )
 
   const compareItems = useMemo(
     () => compareSel.map(id => projects.find(p => p.id === id)).filter(Boolean),
@@ -194,7 +180,7 @@ export default function MapView({ filters, search, sort }) {
           <div className="list-count">
             <strong>{filtered.length.toLocaleString()}</strong>
             {' '}{category.toLowerCase()} project{filtered.length !== 1 ? 's' : ''} found
-            <span className="list-hint"> · tap an area on the map to zoom to it</span>
+            <span className="list-hint"> · tap a number on the map to zoom in</span>
           </div>
         </div>
         <div
@@ -235,7 +221,6 @@ export default function MapView({ filters, search, sort }) {
       {/* Map + overlays */}
       <MapCanvas
         projects={filtered}
-        zones={zones}
         selectedProject={selectedProject}
         onSelectProject={handleProjectClick}
         compareSelection={compareSel}

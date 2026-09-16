@@ -745,25 +745,27 @@ input  { font-family: var(--font); border: none; outline: none; background: none
   outline-offset: 1px;
 }
 
-/* ─── Zone badges (area + project count) ──────────────────────────────────── */
-.zone-badge {
+/* ─── Number clusters (nearby projects + their count) ─────────────────────── */
+/* Same count bubble the area badges used, without the area name. Its size
+   is mirrored by bubbleSize() in utils/clusters.js — keep the two in step. */
+.cluster-pin {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
   background: var(--white);
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 5px 14px 5px 5px;
+  padding: 5px;
   box-shadow: 0 4px 14px rgba(16, 24, 40, 0.18);
   font-family: var(--font);
   cursor: pointer;
   transition: transform 0.15s, box-shadow 0.15s;
 }
-.zone-badge:hover {
+.cluster-pin:hover {
   transform: scale(1.07);
   box-shadow: 0 6px 22px rgba(16, 24, 40, 0.26);
 }
-.zone-badge strong {
+.cluster-pin strong {
   min-width: 26px;
   height: 26px;
   padding: 0 7px;
@@ -775,12 +777,6 @@ input  { font-family: var(--font); border: none; outline: none; background: none
   display: flex;
   align-items: center;
   justify-content: center;
-}
-.zone-badge span {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--gray-800);
-  white-space: nowrap;
 }
 
 /* ─── Airbnb-style price pins ─────────────────────────────────────────────── */

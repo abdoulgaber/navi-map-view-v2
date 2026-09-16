@@ -1,5 +1,5 @@
 import {
-  computePlacements, repairOverlaps, chooseChips, estimatePillW,
+  computePlacements, repairOverlaps, estimatePillW,
   PILL_H, DOT_SIZE,
 } from './placement.js'
 
@@ -18,34 +18,34 @@ const overlap = (a, b) => {
 let rng = 12345
 const rand = () => ((rng = (rng * 1664525 + 1013904223) & 0xffffffff) >>> 0) / 0xffffffff
 
-function makeScenario(name, count, spread, areas) {
+function makeScenario(name, count, spread) {
   const entries = []
   for (let i = 0; i < count; i++) {
-    const area = areas[i % areas.length]
     entries.push({
       id: i,
       x: 400 + (rand() - 0.5) * spread,
       y: 400 + (rand() - 0.5) * spread,
       label: `EGP ${(rand() * 25 + 1).toFixed(1)}M`,
-      area,
     })
   }
   return { name, entries }
 }
 
-const areas = ['New Cairo', 'Sheikh Zayed', 'North Coast']
-const popularity = new Map([['New Cairo', 120], ['Sheikh Zayed', 40], ['North Coast', 8]])
-
 const scenarios = [
-  makeScenario('country zoom (very dense, 500 pins in 300px)', 500, 300, areas),
-  makeScenario('city zoom (200 pins in 900px)', 200, 900, areas),
-  makeScenario('street zoom (40 pins spread over 1600px)', 40, 1600, areas),
-  makeScenario('pathological (100 pins on identical point)', 100, 0, areas),
+  makeScenario('country zoom (very dense, 500 pins in 300px)', 500, 300),
+  makeScenario('city zoom (200 pins in 900px)', 200, 900),
+  makeScenario('street zoom (40 pins spread over 1600px)', 40, 1600),
+  makeScenario('pathological (100 pins on identical point)', 100, 0),
 ]
+
+/* two cluster bubbles every pin has to leave alone */
+const bubbles = [{ x: 380, y: 390, w: 48, h: 38 }, { x: 620, y: 300, w: 40, h: 38 }]
+const bubbleRect = (b) => ({ x1: b.x - b.w / 2, y1: b.y - b.h / 2, x2: b.x + b.w / 2, y2: b.y + b.h / 2 })
 
 let failures = 0
 for (const { name, entries } of scenarios) {
-  const { modes, hidden } = computePlacements(entries, popularity, entries[5]?.id ?? null)
+  const selectedId = entries[5]?.id ?? null
+  const { modes, hidden } = computePlacements(entries, { priorityIds: [selectedId], fixed: bubbles })
 
   const shown = entries
     .map(e => ({ e, mode: modes.get(e.id) }))
@@ -58,19 +58,21 @@ for (const { name, entries } of scenarios) {
       if (o > 0) { pairs++; worst = Math.max(worst, o) }
     }
 
+  // pins covering a bubble (the selected project is allowed to)
+  const onBubble = shown.filter(s => s.e.id !== selectedId &&
+    bubbles.some(b => overlap(renderedRect(s.e, s.mode), bubbleRect(b)) > 0)).length
+
   const pills = shown.filter(s => s.mode === 'pill')
   const dots  = shown.filter(s => s.mode === 'dot')
-  // priority checks
-  const selectedKeptPill = modes.get(entries[5]?.id) === 'pill'
-  const topAreaShare = pills.filter(p => p.e.area === 'New Cairo').length / (pills.length || 1)
+  const selectedShown = modes.get(selectedId) !== 'hidden'
 
-  const ok = pairs === 0 && selectedKeptPill
+  const ok = pairs === 0 && onBubble === 0 && selectedShown
   if (!ok) failures++
   console.log(
     `${ok ? 'PASS' : 'FAIL'}  ${name}\n` +
     `      pills=${pills.length} dots=${dots.length} hidden=${hidden} ` +
-    `overlappingPairs=${pairs} worstOverlapPx=${worst.toFixed(1)}\n` +
-    `      selectedKeptPill=${selectedKeptPill} busiestAreaShareOfPills=${(topAreaShare * 100).toFixed(0)}%`
+    `overlappingPairs=${pairs} worstOverlapPx=${worst.toFixed(1)} pinsOnBubbles=${onBubble}\n` +
+    `      selected=${modes.get(selectedId)}`
   )
 }
 
@@ -125,44 +127,6 @@ for (const { name, entries } of scenarios) {
   )
 }
 
-
-/* ── area chip selection ──────────────────────────────────────────────── */
-{
-  const assert = (ok, msg) => { if (!ok) { failures++; console.log('FAIL  ' + msg) } }
-  const view = { left: 0, top: 0, right: 1440, bottom: 900 }
-  const chip = (id, count, x, y) => ({ id, count, rect: { left: x, top: y, right: x + 120, bottom: y + 38 } })
-  const overlaps = (a, b) =>
-    a.rect.left < b.rect.right && a.rect.right > b.rect.left &&
-    a.rect.top < b.rect.bottom && a.rect.bottom > b.rect.top
-
-  // 1. spread out: capped at `max`, never overlapping
-  const spread = Array.from({ length: 20 }, (_, i) =>
-    chip(i, 100 - i, 40 + (i % 5) * 260, 40 + Math.floor(i / 5) * 200))
-  const shownSpread = chooseChips(spread, view, { max: 7 })
-  const picked = spread.filter(c => shownSpread.has(c.id))
-  let pairs = 0
-  for (let i = 0; i < picked.length; i++)
-    for (let j = i + 1; j < picked.length; j++)
-      if (overlaps(picked[i], picked[j])) pairs++
-  assert(picked.length === 7, `spread: expected 7 chips, got ${picked.length}`)
-  assert(pairs === 0, `spread: ${pairs} overlapping chips`)
-  // busiest win
-  assert(picked.every(c => c.count >= 94), 'spread: busiest areas were not preferred')
-  console.log(`PASS  chips spread out → ${picked.length}/20 shown, ${pairs} overlaps, busiest kept`)
-
-  // 2. dense pile (globe zoom): everything on the same spot → exactly one
-  const pile = Array.from({ length: 25 }, (_, i) => chip(i, 50 + i, 700 + i % 3, 440))
-  const shownPile = chooseChips(pile, view, { max: 7 })
-  assert(shownPile.size === 1, `pile: expected 1 chip, got ${shownPile.size}`)
-  console.log(`PASS  chips piled at one point → ${shownPile.size} shown (no stacking)`)
-
-  // 3. off-screen chips are never labelled
-  const off = [chip(0, 999, -400, 440), chip(1, 998, 2000, 440), chip(2, 5, 600, 400)]
-  const shownOff = chooseChips(off, view, { max: 7 })
-  assert(!shownOff.has(0) && !shownOff.has(1) && shownOff.has(2),
-    'off-screen chips were not skipped')
-  console.log('PASS  off-screen chips skipped, on-screen one kept')
-}
 
 console.log(failures === 0 ? '\nALL SCENARIOS PASS — zero overlaps at every density' : `\n${failures} SCENARIO(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
